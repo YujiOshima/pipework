@@ -18,6 +18,11 @@ if [ "$2" = "-i" ]; then
   shift 2
 fi
 
+if [ "$2" = "-l" ]; then
+  LOCAL_IFNAME=$3
+  shift 2
+fi
+
 GUESTNAME=$2
 IPADDR=$3
 MACADDR=$4
@@ -35,8 +40,8 @@ esac
 
 [ "$IPADDR" ] || [ "$WAIT" ] || {
   echo "Syntax:"
-  echo "pipework <hostinterface> [-i containerinterface] <guest> <ipaddr>/<subnet>[@default_gateway] [macaddr][@vlan]"
-  echo "pipework <hostinterface> [-i containerinterface] <guest> dhcp [macaddr][@vlan]"
+  echo "pipework <hostinterface> [-i containerinterface] [-l localinterfacename] <guest> <ipaddr>/<subnet>[@default_gateway] [macaddr][@vlan]"
+  echo "pipework <hostinterface> [-i containerinterface] [-l localinterfacename] <guest> dhcp [macaddr][@vlan]"
   echo "pipework --wait [-i containerinterface]"
   exit 1
 }
@@ -71,10 +76,11 @@ if [ -z "$WAIT" ]; then
     elif installed ovs-vsctl && ovs-vsctl list-br|grep -q "^${IFNAME}$"; then
       IFTYPE=bridge
       BRTYPE=openvswitch
-    elif [ "$(cat "/sys/class/net/$IFNAME/type")" -eq 32 ]; then # Infiniband IPoIB interface type 32
+    elif [ "$(cat "/sys/class/net/$IFNAME/type")" -eq 32 ]; then # InfiniBand IPoIB interface type 32
       IFTYPE=ipoib
       # The IPoIB kernel module is fussy, set device name to ib0 if not overridden
       CONTAINER_IFNAME=${CONTAINER_IFNAME:-ib0}
+      PKEY=$VLAN
     else IFTYPE=phys
     fi
   else
@@ -158,36 +164,44 @@ case "$N" in
   *) die 1 "Found more than one container matching $GUESTNAME." ;;
 esac
 
-if [ "$IPADDR" = "dhcp" ]; then
-  # Check for first available dhcp client
-  DHCP_CLIENT_LIST="udhcpc dhcpcd dhclient"
-  for CLIENT in $DHCP_CLIENT_LIST; do
-    installed "$CLIENT" && {
-      DHCP_CLIENT=$CLIENT
-      break
-    }
-  done
-  [ -z "$DHCP_CLIENT" ] && {
-    die 1 "You asked for DHCP; but no DHCP client could be found."
-  }
-else
-  # Check if a subnet mask was provided.
+case "$IPADDR" in
+  # Let's check first if the user asked for DHCP allocation.
+  dhcp|dhcp:*)
+    # Use Docker-specific strategy to run the DHCP client
+    # from the busybox image, in the network namespace of
+    # the container.
+    if ! [ "$DOCKERPID" ]; then
+      warn "You asked for a Docker-specific DHCP method."
+      warn "However, $GUESTNAME doesn't seem to be a Docker container."
+      warn "Try to replace 'dhcp' with another option?"
+      die 1 "Aborting."
+    fi
+    DHCP_CLIENT=${IPADDR%%:*}
+    ;;
+  udhcpc|udhcpc:*|dhcpcd|dhcpcd:*|dhclient|dhclient:*)
+    DHCP_CLIENT=${IPADDR%%:*}
+    if ! installed "$DHCP_CLIENT"; then
+      die 1 "You asked for DHCP client $DHCP_CLIENT, but I can't find it."
+    fi
+    ;;
+  # Alright, no DHCP? Then let's see if we have a subnet *and* gateway.
+  */*@*)
+    GATEWAY="${IPADDR#*@}" GATEWAY="${GATEWAY%%@*}"
+    IPADDR="${IPADDR%%@*}"
+    ;;
+  # No gateway? We need at least a subnet, anyway!
+  */*) : ;;
+  # ... No? Then stop right here.
+  *)
+    warn "The IP address should include a netmask."
+    die 1 "Maybe you meant $IPADDR/24 ?"
+    ;;
+esac
+
+# If a DHCP method was specified, extract the DHCP options.
+if [ "$DHCP_CLIENT" ]; then
   case "$IPADDR" in
-    */*) : ;;
-    *)
-      warn "The IP address should include a netmask."
-      die 1 "Maybe you meant $IPADDR/24 ?"
-      ;;
-  esac
-  # Check if a gateway address was provided.
-  case "$IPADDR" in
-    *@*)
-      GATEWAY="${IPADDR#*@}" GATEWAY="${GATEWAY%%@*}"
-      IPADDR="${IPADDR%%@*}"
-      ;;
-    *)
-      GATEWAY=
-      ;;
+    *:*) DHCP_OPTIONS="${IPADDR#*:}" ;;
   esac
 fi
 
@@ -196,7 +210,11 @@ if [ "$DOCKERPID" ]; then
 else
   NSPID=$(head -n 1 "$(find "$CGROUPMNT" -name "$GUESTNAME" | head -n 1)/tasks")
   [ "$NSPID" ] || {
-    die 1 "Could not find a process inside container $GUESTNAME."
+    # it is an alternative way to get the pid
+    NSPID=$(lxc-info -n  "$GUESTNAME" | grep PID | grep -Eo '[0-9]+')
+    [ "$NSPID" ] || {
+      die 1 "Could not find a process inside container $GUESTNAME."
+    }
   }
 fi
 
@@ -225,27 +243,32 @@ ln -s "/proc/$NSPID/ns/net" "/var/run/netns/$NSPID"
 MTU=$(ip link show "$IFNAME" | awk '{print $5}')
 # If it's a bridge, we need to create a veth pair
 [ "$IFTYPE" = bridge ] && {
-  LOCAL_IFNAME="v${CONTAINER_IFNAME}pl${NSPID}"
+  if [ -z "$LOCAL_IFNAME" ]; then
+    LOCAL_IFNAME="v${CONTAINER_IFNAME}pl${NSPID}"
+  fi
   GUEST_IFNAME="v${CONTAINER_IFNAME}pg${NSPID}"
+  # Does the link already exist?
+  if ip link show "$LOCAL_IFNAME" >/dev/null 2>&1; then
+    # link exists, is it in use?
+    if ip link show "$LOCAL_IFNAME" up | grep -q "UP"; then
+      echo "Link $LOCAL_IFNAME exists and is up"
+      exit 1
+    fi
+    # delete the link so we can re-add it afterwards
+    ip link del "$LOCAL_IFNAME"
+  fi
   ip link add name "$LOCAL_IFNAME" mtu "$MTU" type veth peer name "$GUEST_IFNAME" mtu "$MTU"
   case "$BRTYPE" in
     linux)
       (ip link set "$LOCAL_IFNAME" master "$IFNAME" > /dev/null 2>&1) || (brctl addif "$IFNAME" "$LOCAL_IFNAME")
       ;;
     openvswitch)
-      ovs-vsctl add-port "$IFNAME" "$LOCAL_IFNAME" ${VLAN:+tag="$VLAN"}
+      if ! ovs-vsctl list-ports "$IFNAME" | grep -q "$LOCAL_IFNAME"; then
+        ovs-vsctl add-port "$IFNAME" "$LOCAL_IFNAME" ${VLAN:+tag="$VLAN"}
+      fi
       ;;
   esac
   ip link set "$LOCAL_IFNAME" up
-}
-
-# Note: if no container interface name was specified, pipework will default to ib0
-# Note: no macvlan subinterface or ethernet bridge can be created against an 
-# ipoib interface. Infiniband is not ethernet. ipoib is an IP layer for it.
-# To provide additional ipoib interfaces to containers use SR-IOV and pipework 
-# to assign them.
-[ "$IFTYPE" = ipoib ] && {
-  GUEST_IFNAME=$CONTAINER_IFNAME
 }
 
 # If it's a physical interface, create a macvlan subinterface
@@ -262,31 +285,71 @@ MTU=$(ip link show "$IFNAME" | awk '{print $5}')
   ip link set "$IFNAME" up
 }
 
+# If it's an IPoIB interface, create a virtual IPoIB interface (the IPoIB
+# equivalent of a macvlan device)
+#
+# Note: no macvlan subinterface nor Ethernet bridge can be created on top of an
+# IPoIB interface. InfiniBand is not Ethernet. IPoIB is an IP layer on top of
+# InfiniBand, without an intermediate Ethernet layer.
+[ "$IFTYPE" = ipoib ] && {
+  GUEST_IFNAME="${IFNAME}.${NSPID}"
+
+  # If a partition key is provided, use it
+  [ "$PKEY" ] && {
+    GUEST_IFNAME="${IFNAME}.${PKEY}.${NSPID}"
+    PKEY="pkey 0x$PKEY"
+  }
+
+  ip link add link "$IFNAME" name "$GUEST_IFNAME" type ipoib $PKEY
+  ip link set "$IFNAME" up
+}
+
 ip link set "$GUEST_IFNAME" netns "$NSPID"
 ip netns exec "$NSPID" ip link set "$GUEST_IFNAME" name "$CONTAINER_IFNAME"
 [ "$MACADDR" ] && ip netns exec "$NSPID" ip link set dev "$CONTAINER_IFNAME" address "$MACADDR"
-if [ "$IPADDR" = "dhcp" ]
-then
-  [ "$DHCP_CLIENT" = "udhcpc"  ] && ip netns exec "$NSPID" "$DHCP_CLIENT" -qi "$CONTAINER_IFNAME" -x "hostname:$GUESTNAME"
-  if [ "$DHCP_CLIENT" = "dhclient"  ]; then
+
+# When using any of the DHCP methods, we start a DHCP client in the
+# network namespace of the container. With the 'dhcp' method, the
+# client used is taken from the Docker busybox image (therefore
+# requiring no specific client installed on the host). Other methods
+# use a locally installed client.
+case "$DHCP_CLIENT" in
+  dhcp)
+    docker run -d --net container:$GUESTNAME --cap-add NET_ADMIN \
+           busybox udhcpc -i "$CONTAINER_IFNAME" -x "hostname:$GUESTNAME" \
+           $DHCP_OPTIONS \
+           >/dev/null
+    ;;
+  udhcpc)
+    ip netns exec "$NSPID" "$DHCP_CLIENT" -qi "$CONTAINER_IFNAME" \
+                                          -x "hostname:$GUESTNAME" \
+                                          $DHCP_OPTIONS
+    ;;
+  dhclient)
+    ip netns exec "$NSPID" "$DHCP_CLIENT" "$CONTAINER_IFNAME" \
+                                          -pf "/var/run/dhclient.$NSPID.pid" \
+                                          -H "$GUESTNAME" \
+                                          $DHCP_OPTIONS
     # kill dhclient after get ip address to prevent device be used after container close
-    ip netns exec "$NSPID" "$DHCP_CLIENT" -pf "/var/run/dhclient.$NSPID.pid" "$CONTAINER_IFNAME"
     kill "$(cat "/var/run/dhclient.$NSPID.pid")"
     rm "/var/run/dhclient.$NSPID.pid"
-  fi
-  [ "$DHCP_CLIENT" = "dhcpcd"  ] && ip netns exec "$NSPID" "$DHCP_CLIENT" -q "$CONTAINER_IFNAME" -h "$GUESTNAME"
-else
-  ip netns exec "$NSPID" ip addr add "$IPADDR" dev "$CONTAINER_IFNAME"
-  [ "$GATEWAY" ] && {
-    ip netns exec "$NSPID" ip route delete default >/dev/null 2>&1 && true
-  }
-  ip netns exec "$NSPID" ip link set "$CONTAINER_IFNAME" up
-  [ "$GATEWAY" ] && {
-    ip netns exec "$NSPID" ip route get "$GATEWAY" >/dev/null 2>&1 || \
-    ip netns exec "$NSPID" ip route add "$GATEWAY/32" dev "$CONTAINER_IFNAME"
-    ip netns exec "$NSPID" ip route replace default via "$GATEWAY"
-  }
-fi
+    ;;
+  dhcpcd)
+    ip netns exec "$NSPID" "$DHCP_CLIENT" -q "$CONTAINER_IFNAME" -h "$GUESTNAME"
+    ;;
+  "")
+    ip netns exec "$NSPID" ip addr add "$IPADDR" dev "$CONTAINER_IFNAME"
+    [ "$GATEWAY" ] && {
+      ip netns exec "$NSPID" ip route delete default >/dev/null 2>&1 && true
+    }
+    ip netns exec "$NSPID" ip link set "$CONTAINER_IFNAME" up
+    [ "$GATEWAY" ] && {
+      ip netns exec "$NSPID" ip route get "$GATEWAY" >/dev/null 2>&1 || \
+      ip netns exec "$NSPID" ip route add "$GATEWAY/32" dev "$CONTAINER_IFNAME"
+      ip netns exec "$NSPID" ip route replace default via "$GATEWAY"
+    }
+    ;;
+esac
 
 # Give our ARP neighbors a nudge about the new interface
 if installed arping; then
